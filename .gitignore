@@ -1,0 +1,27 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Workspace data
+workspace/
+r2-workspace/
+incoming/
+processing/
+outgoing/
+
+# Logs
+logs/
+*.log
+
+# Lock files
+*.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp files
+tmp/
+temp/
+*.tmp
