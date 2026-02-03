@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
 #
-# r2-processor.sh - Secure automated file processing between Cloudflare R2 buckets
+# r2-processor.sh - Read-only R2 bucket scanner and notification system
+#
+# This script ONLY lists files in the incoming/ folder and reports what's found.
+# It does NOT download, process, move, or modify any files in the bucket.
 #
 # Usage: ./r2-processor.sh [OPTIONS]
 #   -c, --config FILE    Path to config file (default: ~/.config/r2-processor/config)
-#   -d, --dry-run        Run without making changes
+#   -r, --report-only    Just list files without any processing (default behavior)
 #   -v, --verbose        Enable verbose output
+#   -j, --json           Output report in JSON format
 #   -h, --help           Show this help message
 #
 # Environment variables (or set in config file):
 #   R2_REMOTE_NAME       rclone remote name (required)
 #   R2_BUCKET_NAME       R2 bucket name (required)
 #   R2_INCOMING_PREFIX   Incoming folder prefix (default: incoming/)
-#   R2_OUTGOING_PREFIX   Outgoing folder prefix (default: outgoing/)
-#   R2_PROCESSED_PREFIX  Processed folder prefix (default: processed/)
-#   WORKSPACE_DIR        Local workspace directory (default: /tmp/r2-processor)
-#   LOG_FILE             Log file path (default: /var/log/r2-processor.log)
-#   LOCK_FILE            Lock file path (default: /tmp/r2-processor.lock)
-#   MAX_FILE_SIZE_MB     Maximum file size in MB (default: 100)
+#   MAX_FILE_SIZE_MB     Maximum file size in MB for validation (default: 100)
 #   ALLOWED_EXTENSIONS   Comma-separated allowed extensions (default: txt,csv,json,xml,pdf)
 #
 
@@ -29,47 +28,26 @@ IFS=$'\n\t'
 # =============================================================================
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly SCRIPT_PID=$$
 
 # Default configuration values
 DEFAULT_INCOMING_PREFIX="incoming/"
-DEFAULT_OUTGOING_PREFIX="outgoing/"
-DEFAULT_PROCESSED_PREFIX="processed/"
-DEFAULT_WORKSPACE_DIR="/tmp/r2-processor"
-DEFAULT_LOG_FILE="/var/log/r2-processor.log"
-DEFAULT_LOCK_FILE="/tmp/r2-processor.lock"
 DEFAULT_MAX_FILE_SIZE_MB=100
-DEFAULT_ALLOWED_EXTENSIONS="txt,csv,json,xml,pdf"
+DEFAULT_ALLOWED_EXTENSIONS="txt,csv,json,xml,pdf,mp3,wav,md,png,jpg,jpeg,gif"
 DEFAULT_CONFIG_FILE="${HOME}/.config/r2-processor/config"
 
 # Runtime flags
-DRY_RUN=false
 VERBOSE=false
+JSON_OUTPUT=false
+REPORT_ONLY=true  # Always true - this is now a read-only scanner
 CONFIG_FILE=""
 
 # =============================================================================
 # LOGGING FUNCTIONS
 # =============================================================================
 
-# Initialize logging - creates log file with secure permissions
-init_logging() {
-    local log_dir
-    log_dir="$(dirname "${LOG_FILE}")"
-    
-    if [[ ! -d "${log_dir}" ]]; then
-        mkdir -p "${log_dir}" 2>/dev/null || {
-            # Fall back to temp directory if can't create log dir
-            LOG_FILE="/tmp/r2-processor-${USER:-unknown}.log"
-        }
-    fi
-    
-    # Create log file with restrictive permissions (600)
-    touch "${LOG_FILE}" 2>/dev/null || true
-    chmod 600 "${LOG_FILE}" 2>/dev/null || true
-}
-
-# Log message to both stdout and log file
+# Log message to stderr (keeps stdout clean for reports)
 # Usage: log LEVEL MESSAGE
 log() {
     local level="$1"
@@ -77,18 +55,15 @@ log() {
     local message="$*"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    local log_line="[${timestamp}] [${level}] [PID:${SCRIPT_PID}] ${message}"
+    local log_line="[${timestamp}] [${level}] ${message}"
     
-    # Write to log file (if writable)
-    echo "${log_line}" >> "${LOG_FILE}" 2>/dev/null || true
-    
-    # Write to stdout with color coding
+    # Write to stderr with color coding
     case "${level}" in
         ERROR)   echo -e "\033[31m${log_line}\033[0m" >&2 ;;
         WARN)    echo -e "\033[33m${log_line}\033[0m" >&2 ;;
-        INFO)    echo "${log_line}" ;;
-        DEBUG)   [[ "${VERBOSE}" == "true" ]] && echo -e "\033[36m${log_line}\033[0m" ;;
-        *)       echo "${log_line}" ;;
+        INFO)    [[ "${VERBOSE}" == "true" ]] && echo "${log_line}" >&2 ;;
+        DEBUG)   [[ "${VERBOSE}" == "true" ]] && echo -e "\033[36m${log_line}\033[0m" >&2 ;;
+        *)       echo "${log_line}" >&2 ;;
     esac
 }
 
@@ -98,40 +73,20 @@ log_error() { log "ERROR" "$@"; }
 log_debug() { log "DEBUG" "$@"; }
 
 # =============================================================================
-# SECURITY FUNCTIONS
+# SECURITY FUNCTIONS (Read-only validation)
 # =============================================================================
 
-# Sanitize filename to prevent path traversal and command injection
+# Sanitize filename for display/validation only (no file operations)
 # Returns sanitized filename via stdout
 sanitize_filename() {
     local filename="$1"
     local sanitized
     
-    # Remove path components (prevent path traversal)
+    # Remove path components (prevent path traversal in display)
     sanitized="$(basename "${filename}")"
     
     # Remove null bytes
     sanitized="${sanitized//$'\0'/}"
-    
-    # Remove leading dots (prevent hidden files)
-    sanitized="${sanitized#.}"
-    
-    # Replace dangerous characters with underscores
-    # Allow only alphanumeric, dots, hyphens, underscores
-    sanitized="$(echo "${sanitized}" | sed 's/[^a-zA-Z0-9._-]/_/g')"
-    
-    # Prevent empty filename
-    if [[ -z "${sanitized}" ]]; then
-        sanitized="unnamed_file"
-    fi
-    
-    # Truncate if too long (max 255 chars for most filesystems)
-    if [[ ${#sanitized} -gt 255 ]]; then
-        local ext="${sanitized##*.}"
-        local name="${sanitized%.*}"
-        local max_name_len=$((250 - ${#ext}))
-        sanitized="${name:0:${max_name_len}}.${ext}"
-    fi
     
     echo "${sanitized}"
 }
@@ -158,78 +113,16 @@ validate_file_type() {
     return 1
 }
 
-# Validate file size
+# Check if a file would pass size validation (based on remote size info)
 # Returns 0 if within limit, 1 if too large
-validate_file_size() {
-    local file_path="$1"
+validate_remote_file_size() {
+    local file_size="$1"
     local max_bytes=$((MAX_FILE_SIZE_MB * 1024 * 1024))
-    local file_size
     
-    if [[ -f "${file_path}" ]]; then
-        file_size="$(stat -c%s "${file_path}" 2>/dev/null || stat -f%z "${file_path}" 2>/dev/null || echo 0)"
-        if [[ ${file_size} -gt ${max_bytes} ]]; then
-            log_warn "File exceeds size limit: ${file_path} (${file_size} bytes > ${max_bytes} bytes)"
-            return 1
-        fi
+    if [[ ${file_size} -gt ${max_bytes} ]]; then
+        return 1
     fi
     return 0
-}
-
-# Create secure temporary directory
-# Returns path via stdout
-create_secure_temp_dir() {
-    local prefix="${1:-r2proc}"
-    local temp_dir
-    
-    # Create temp directory with restrictive permissions
-    temp_dir="$(mktemp -d -t "${prefix}.XXXXXXXXXX")"
-    chmod 700 "${temp_dir}"
-    
-    echo "${temp_dir}"
-}
-
-# =============================================================================
-# LOCK FILE MANAGEMENT
-# =============================================================================
-
-# Acquire lock to prevent concurrent execution
-acquire_lock() {
-    local lock_dir
-    lock_dir="$(dirname "${LOCK_FILE}")"
-    
-    # Ensure lock directory exists
-    mkdir -p "${lock_dir}" 2>/dev/null || true
-    
-    # Try to acquire lock using atomic operation
-    if ! (set -o noclobber; echo "${SCRIPT_PID}" > "${LOCK_FILE}") 2>/dev/null; then
-        # Lock file exists - check if process is still running
-        local existing_pid
-        existing_pid="$(cat "${LOCK_FILE}" 2>/dev/null || echo "")"
-        
-        if [[ -n "${existing_pid}" ]] && kill -0 "${existing_pid}" 2>/dev/null; then
-            log_error "Another instance is already running (PID: ${existing_pid})"
-            return 1
-        else
-            log_warn "Stale lock file found, removing"
-            rm -f "${LOCK_FILE}"
-            echo "${SCRIPT_PID}" > "${LOCK_FILE}"
-        fi
-    fi
-    
-    log_debug "Lock acquired: ${LOCK_FILE}"
-    return 0
-}
-
-# Release lock
-release_lock() {
-    if [[ -f "${LOCK_FILE}" ]]; then
-        local lock_pid
-        lock_pid="$(cat "${LOCK_FILE}" 2>/dev/null || echo "")"
-        if [[ "${lock_pid}" == "${SCRIPT_PID}" ]]; then
-            rm -f "${LOCK_FILE}"
-            log_debug "Lock released: ${LOCK_FILE}"
-        fi
-    fi
 }
 
 # =============================================================================
@@ -249,9 +142,7 @@ load_config() {
         fi
         
         # Source config file (only if it contains valid variable assignments)
-        # shellcheck source=/dev/null
         if grep -qE '^[A-Z_]+=' "${config_file}" 2>/dev/null; then
-            # Only source lines that look like variable assignments
             while IFS='=' read -r key value; do
                 # Skip comments and empty lines
                 [[ "${key}" =~ ^[[:space:]]*# ]] && continue
@@ -277,11 +168,6 @@ init_config() {
     R2_REMOTE_NAME="${R2_REMOTE_NAME:-}"
     R2_BUCKET_NAME="${R2_BUCKET_NAME:-}"
     R2_INCOMING_PREFIX="${R2_INCOMING_PREFIX:-${DEFAULT_INCOMING_PREFIX}}"
-    R2_OUTGOING_PREFIX="${R2_OUTGOING_PREFIX:-${DEFAULT_OUTGOING_PREFIX}}"
-    R2_PROCESSED_PREFIX="${R2_PROCESSED_PREFIX:-${DEFAULT_PROCESSED_PREFIX}}"
-    WORKSPACE_DIR="${WORKSPACE_DIR:-${DEFAULT_WORKSPACE_DIR}}"
-    LOG_FILE="${LOG_FILE:-${DEFAULT_LOG_FILE}}"
-    LOCK_FILE="${LOCK_FILE:-${DEFAULT_LOCK_FILE}}"
     MAX_FILE_SIZE_MB="${MAX_FILE_SIZE_MB:-${DEFAULT_MAX_FILE_SIZE_MB}}"
     ALLOWED_EXTENSIONS="${ALLOWED_EXTENSIONS:-${DEFAULT_ALLOWED_EXTENSIONS}}"
     
@@ -296,16 +182,14 @@ init_config() {
         return 1
     fi
     
-    # Ensure prefixes end with /
+    # Ensure prefix ends with /
     [[ "${R2_INCOMING_PREFIX}" != */ ]] && R2_INCOMING_PREFIX="${R2_INCOMING_PREFIX}/"
-    [[ "${R2_OUTGOING_PREFIX}" != */ ]] && R2_OUTGOING_PREFIX="${R2_OUTGOING_PREFIX}/"
-    [[ "${R2_PROCESSED_PREFIX}" != */ ]] && R2_PROCESSED_PREFIX="${R2_PROCESSED_PREFIX}/"
     
     return 0
 }
 
 # =============================================================================
-# RCLONE WRAPPER FUNCTIONS
+# RCLONE WRAPPER FUNCTIONS (Read-only)
 # =============================================================================
 
 # Build rclone remote path
@@ -314,14 +198,27 @@ build_remote_path() {
     echo "${R2_REMOTE_NAME}:${R2_BUCKET_NAME}/${prefix}"
 }
 
-# List files in remote prefix
-# Returns list of filenames (one per line)
-list_remote_files() {
+# List files in remote prefix with details
+# Returns: filename|size|modtime (one per line)
+list_remote_files_detailed() {
     local prefix="$1"
     local remote_path
     remote_path="$(build_remote_path "${prefix}")"
     
     log_debug "Listing files in: ${remote_path}"
+    
+    # Use lsjson for detailed info, extract what we need
+    if ! rclone lsjson "${remote_path}" --files-only 2>/dev/null; then
+        log_error "Failed to list files in ${remote_path}"
+        return 1
+    fi
+}
+
+# Simple file list (names only)
+list_remote_files_simple() {
+    local prefix="$1"
+    local remote_path
+    remote_path="$(build_remote_path "${prefix}")"
     
     if ! rclone lsf "${remote_path}" --files-only 2>/dev/null; then
         log_error "Failed to list files in ${remote_path}"
@@ -329,296 +226,237 @@ list_remote_files() {
     fi
 }
 
-# Download file from remote
-download_file() {
-    local remote_file="$1"
-    local local_dir="$2"
-    local source_path
-    local dest_path
-    local sanitized_name
+# =============================================================================
+# REPORT GENERATION
+# =============================================================================
+
+# Generate a summary report of files found
+generate_summary_report() {
+    local files_json="$1"
     
-    # Sanitize the filename
-    sanitized_name="$(sanitize_filename "${remote_file}")"
+    local total_files=0
+    local valid_files=0
+    local invalid_type_files=0
+    local oversized_files=0
+    local total_size=0
+    local file_list=""
+    local invalid_list=""
+    local oversized_list=""
     
-    source_path="$(build_remote_path "${R2_INCOMING_PREFIX}${remote_file}")"
-    dest_path="${local_dir}/${sanitized_name}"
+    # Parse JSON and validate each file
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        
+        # Extract fields from JSON line (simple parsing)
+        local name size
+        name=$(echo "${line}" | grep -oP '"Name"\s*:\s*"\K[^"]+' || echo "")
+        size=$(echo "${line}" | grep -oP '"Size"\s*:\s*\K[0-9]+' || echo "0")
+        
+        [[ -z "${name}" ]] && continue
+        
+        ((total_files++)) || true
+        total_size=$((total_size + size))
+        
+        local sanitized_name
+        sanitized_name="$(sanitize_filename "${name}")"
+        
+        # Check file type
+        if ! validate_file_type "${sanitized_name}"; then
+            ((invalid_type_files++)) || true
+            invalid_list="${invalid_list}${sanitized_name}, "
+            continue
+        fi
+        
+        # Check file size
+        if ! validate_remote_file_size "${size}"; then
+            ((oversized_files++)) || true
+            oversized_list="${oversized_list}${sanitized_name} ($(format_size ${size})), "
+            continue
+        fi
+        
+        ((valid_files++)) || true
+        file_list="${file_list}${sanitized_name}, "
+        
+    done < <(echo "${files_json}" | grep -o '{[^}]*}')
     
-    log_info "Downloading: ${remote_file} -> ${dest_path}"
+    # Clean up trailing commas
+    file_list="${file_list%, }"
+    invalid_list="${invalid_list%, }"
+    oversized_list="${oversized_list%, }"
     
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        log_info "[DRY-RUN] Would download: ${source_path}"
-        return 0
+    # Output report
+    if [[ "${JSON_OUTPUT}" == "true" ]]; then
+        output_json_report "${total_files}" "${valid_files}" "${invalid_type_files}" \
+            "${oversized_files}" "${total_size}" "${file_list}" "${invalid_list}" "${oversized_list}"
+    else
+        output_text_report "${total_files}" "${valid_files}" "${invalid_type_files}" \
+            "${oversized_files}" "${total_size}" "${file_list}" "${invalid_list}" "${oversized_list}"
     fi
-    
-    if ! rclone copyto "${source_path}" "${dest_path}" --no-traverse 2>&1; then
-        log_error "Failed to download: ${remote_file}"
-        return 1
-    fi
-    
-    # Validate downloaded file size
-    if ! validate_file_size "${dest_path}"; then
-        log_error "Downloaded file exceeds size limit, removing: ${dest_path}"
-        rm -f "${dest_path}"
-        return 1
-    fi
-    
-    log_debug "Successfully downloaded: ${remote_file}"
-    return 0
 }
 
-# Upload file to remote
-upload_file() {
-    local local_file="$1"
-    local remote_prefix="$2"
-    local filename
-    local dest_path
-    
-    filename="$(basename "${local_file}")"
-    dest_path="$(build_remote_path "${remote_prefix}${filename}")"
-    
-    log_info "Uploading: ${local_file} -> ${dest_path}"
-    
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        log_info "[DRY-RUN] Would upload: ${local_file} to ${dest_path}"
-        return 0
+# Format bytes to human readable
+format_size() {
+    local bytes="$1"
+    if [[ ${bytes} -ge 1073741824 ]]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", ${bytes}/1073741824}")GB"
+    elif [[ ${bytes} -ge 1048576 ]]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", ${bytes}/1048576}")MB"
+    elif [[ ${bytes} -ge 1024 ]]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", ${bytes}/1024}")KB"
+    else
+        echo "${bytes}B"
     fi
-    
-    if ! rclone copyto "${local_file}" "${dest_path}" --no-traverse 2>&1; then
-        log_error "Failed to upload: ${local_file}"
-        return 1
-    fi
-    
-    log_debug "Successfully uploaded: ${filename}"
-    return 0
 }
 
-# Move file within remote (incoming -> processed)
-move_remote_file() {
-    local filename="$1"
-    local source_path
-    local dest_path
+# Output text report
+output_text_report() {
+    local total_files="$1"
+    local valid_files="$2"
+    local invalid_type_files="$3"
+    local oversized_files="$4"
+    local total_size="$5"
+    local file_list="$6"
+    local invalid_list="$7"
+    local oversized_list="$8"
     
-    source_path="$(build_remote_path "${R2_INCOMING_PREFIX}${filename}")"
-    dest_path="$(build_remote_path "${R2_PROCESSED_PREFIX}${filename}")"
+    echo "========================================"
+    echo "R2 Incoming Folder Scan Report"
+    echo "========================================"
+    echo "Bucket: ${R2_REMOTE_NAME}:${R2_BUCKET_NAME}"
+    echo "Folder: ${R2_INCOMING_PREFIX}"
+    echo "Scan time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "----------------------------------------"
     
-    log_info "Moving remote: ${filename} -> ${R2_PROCESSED_PREFIX}"
-    
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        log_info "[DRY-RUN] Would move: ${source_path} to ${dest_path}"
-        return 0
+    if [[ ${total_files} -eq 0 ]]; then
+        echo "No files found in incoming folder."
+    else
+        echo "Found ${total_files} file(s) ($(format_size ${total_size}) total)"
+        echo ""
+        
+        if [[ ${valid_files} -gt 0 ]]; then
+            echo "✓ Valid files (${valid_files}): ${file_list}"
+        fi
+        
+        if [[ ${invalid_type_files} -gt 0 ]]; then
+            echo "⚠ Invalid type (${invalid_type_files}): ${invalid_list}"
+        fi
+        
+        if [[ ${oversized_files} -gt 0 ]]; then
+            echo "⚠ Oversized (${oversized_files}): ${oversized_list}"
+        fi
     fi
     
-    if ! rclone moveto "${source_path}" "${dest_path}" --no-traverse 2>&1; then
-        log_error "Failed to move remote file: ${filename}"
-        return 1
+    echo "========================================"
+    echo "NOTE: This is a read-only scan. No files were modified."
+    echo "========================================"
+}
+
+# Output JSON report
+output_json_report() {
+    local total_files="$1"
+    local valid_files="$2"
+    local invalid_type_files="$3"
+    local oversized_files="$4"
+    local total_size="$5"
+    local file_list="$6"
+    local invalid_list="$7"
+    local oversized_list="$8"
+    
+    # Convert comma-separated lists to JSON arrays
+    local valid_json="[]"
+    local invalid_json="[]"
+    local oversized_json="[]"
+    
+    if [[ -n "${file_list}" ]]; then
+        valid_json="[$(echo "${file_list}" | sed 's/, /", "/g; s/^/"/; s/$/"/')]"
+    fi
+    if [[ -n "${invalid_list}" ]]; then
+        invalid_json="[$(echo "${invalid_list}" | sed 's/, /", "/g; s/^/"/; s/$/"/')]"
+    fi
+    if [[ -n "${oversized_list}" ]]; then
+        oversized_json="[$(echo "${oversized_list}" | sed 's/, /", "/g; s/^/"/; s/$/"/')]"
     fi
     
-    log_debug "Successfully moved: ${filename}"
-    return 0
+    cat << EOF
+{
+  "bucket": "${R2_REMOTE_NAME}:${R2_BUCKET_NAME}",
+  "folder": "${R2_INCOMING_PREFIX}",
+  "scan_time": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "summary": {
+    "total_files": ${total_files},
+    "valid_files": ${valid_files},
+    "invalid_type": ${invalid_type_files},
+    "oversized": ${oversized_files},
+    "total_size_bytes": ${total_size},
+    "total_size_human": "$(format_size ${total_size})"
+  },
+  "files": {
+    "valid": ${valid_json},
+    "invalid_type": ${invalid_json},
+    "oversized": ${oversized_json}
+  },
+  "read_only": true
+}
+EOF
+}
+
+# Quick one-line summary output
+output_quick_summary() {
+    local files_json="$1"
+    
+    local count=0
+    local names=""
+    
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        local name
+        name=$(echo "${line}" | grep -oP '"Name"\s*:\s*"\K[^"]+' || echo "")
+        [[ -z "${name}" ]] && continue
+        
+        local sanitized
+        sanitized="$(sanitize_filename "${name}")"
+        
+        ((count++)) || true
+        names="${names}${sanitized}, "
+    done < <(echo "${files_json}" | grep -o '{[^}]*}')
+    
+    names="${names%, }"
+    
+    if [[ ${count} -eq 0 ]]; then
+        echo "No new files found in incoming/"
+    else
+        echo "Found ${count} new file(s): ${names}"
+    fi
 }
 
 # =============================================================================
-# PROCESSING FUNCTIONS
+# MAIN SCAN FUNCTION
 # =============================================================================
 
-# Process a single file (STUB - implement your logic here)
-# This is a placeholder that should be replaced with actual processing logic
-# Returns 0 on success, 1 on failure
-# Outputs: processed file path (may be same as input or different)
-process_file() {
-    local input_file="$1"
-    local output_dir="$2"
-    local filename
-    local output_file
-    
-    filename="$(basename "${input_file}")"
-    output_file="${output_dir}/${filename}"
-    
-    log_info "Processing file: ${filename}"
-    
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        log_info "[DRY-RUN] Would process: ${input_file}"
-        echo "${input_file}"
-        return 0
-    fi
-    
-    # =========================================================================
-    # PLACEHOLDER PROCESSING LOGIC
-    # Replace this section with your actual processing code
-    # =========================================================================
-    
-    # Example: Simply copy the file (replace with real processing)
-    if ! cp "${input_file}" "${output_file}"; then
-        log_error "Processing failed for: ${filename}"
-        return 1
-    fi
-    
-    # Example: Add a processing marker to text files
-    if [[ "${filename}" =~ \.(txt|csv|json)$ ]]; then
-        echo "" >> "${output_file}"
-        echo "# Processed by ${SCRIPT_NAME} at $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "${output_file}"
-    fi
-    
-    # =========================================================================
-    # END PLACEHOLDER
-    # =========================================================================
-    
-    log_debug "Processing complete: ${output_file}"
-    echo "${output_file}"
-    return 0
-}
-
-# =============================================================================
-# CLEANUP FUNCTIONS
-# =============================================================================
-
-# Clean up temporary files and directories
-cleanup() {
-    local exit_code="${1:-0}"
-    
-    log_debug "Running cleanup..."
-    
-    # Release lock
-    release_lock
-    
-    # Remove temporary directories (if they exist and are in /tmp)
-    if [[ -n "${TEMP_DOWNLOAD_DIR:-}" ]] && [[ "${TEMP_DOWNLOAD_DIR}" == /tmp/* ]]; then
-        log_debug "Removing temp download dir: ${TEMP_DOWNLOAD_DIR}"
-        rm -rf "${TEMP_DOWNLOAD_DIR}" 2>/dev/null || true
-    fi
-    
-    if [[ -n "${TEMP_OUTPUT_DIR:-}" ]] && [[ "${TEMP_OUTPUT_DIR}" == /tmp/* ]]; then
-        log_debug "Removing temp output dir: ${TEMP_OUTPUT_DIR}"
-        rm -rf "${TEMP_OUTPUT_DIR}" 2>/dev/null || true
-    fi
-    
-    log_debug "Cleanup complete"
-    exit "${exit_code}"
-}
-
-# Trap signals for cleanup
-setup_signal_handlers() {
-    trap 'cleanup 130' INT
-    trap 'cleanup 143' TERM
-    trap 'cleanup $?' EXIT
-}
-
-# =============================================================================
-# MAIN PROCESSING LOOP
-# =============================================================================
-
-# Main processing function
-process_incoming_files() {
-    local files_processed=0
-    local files_failed=0
-    local files_skipped=0
-    
-    log_info "Starting file processing run"
+# Main scanning function (READ-ONLY)
+scan_incoming_files() {
+    log_info "Starting read-only scan"
     log_info "Remote: ${R2_REMOTE_NAME}:${R2_BUCKET_NAME}"
-    log_info "Incoming prefix: ${R2_INCOMING_PREFIX}"
-    log_info "Outgoing prefix: ${R2_OUTGOING_PREFIX}"
-    log_info "Processed prefix: ${R2_PROCESSED_PREFIX}"
+    log_info "Scanning: ${R2_INCOMING_PREFIX}"
     
-    if [[ "${DRY_RUN}" == "true" ]]; then
-        log_warn "DRY-RUN MODE: No changes will be made"
-    fi
-    
-    # Create secure temporary directories
-    TEMP_DOWNLOAD_DIR="$(create_secure_temp_dir "r2-download")"
-    TEMP_OUTPUT_DIR="$(create_secure_temp_dir "r2-output")"
-    
-    log_debug "Temp download dir: ${TEMP_DOWNLOAD_DIR}"
-    log_debug "Temp output dir: ${TEMP_OUTPUT_DIR}"
-    
-    # List files in incoming folder
-    local incoming_files
-    incoming_files="$(list_remote_files "${R2_INCOMING_PREFIX}")" || {
+    # Get file list with details
+    local files_json
+    files_json="$(list_remote_files_detailed "${R2_INCOMING_PREFIX}")" || {
         log_error "Failed to list incoming files"
         return 1
     }
     
-    if [[ -z "${incoming_files}" ]]; then
-        log_info "No files found in incoming folder"
+    if [[ -z "${files_json}" ]] || [[ "${files_json}" == "[]" ]]; then
+        if [[ "${JSON_OUTPUT}" == "true" ]]; then
+            output_json_report 0 0 0 0 0 "" "" ""
+        else
+            echo "No files found in incoming/"
+        fi
         return 0
     fi
     
-    # Process each file
-    while IFS= read -r remote_file; do
-        [[ -z "${remote_file}" ]] && continue
-        
-        log_info "----------------------------------------"
-        log_info "Processing: ${remote_file}"
-        
-        # Validate file type
-        if ! validate_file_type "${remote_file}"; then
-            log_warn "Skipping file with disallowed extension: ${remote_file}"
-            ((files_skipped++)) || true
-            continue
-        fi
-        
-        # Sanitize filename
-        local safe_filename
-        safe_filename="$(sanitize_filename "${remote_file}")"
-        log_debug "Sanitized filename: ${safe_filename}"
-        
-        # Download file
-        if ! download_file "${remote_file}" "${TEMP_DOWNLOAD_DIR}"; then
-            log_error "Failed to download: ${remote_file}"
-            ((files_failed++)) || true
-            continue
-        fi
-        
-        local local_file="${TEMP_DOWNLOAD_DIR}/${safe_filename}"
-        
-        # Skip if file doesn't exist (dry-run mode)
-        if [[ "${DRY_RUN}" != "true" ]] && [[ ! -f "${local_file}" ]]; then
-            log_error "Downloaded file not found: ${local_file}"
-            ((files_failed++)) || true
-            continue
-        fi
-        
-        # Process file
-        local processed_file
-        processed_file="$(process_file "${local_file}" "${TEMP_OUTPUT_DIR}")" || {
-            log_error "Failed to process: ${remote_file}"
-            ((files_failed++)) || true
-            continue
-        }
-        
-        # Upload processed file to outgoing
-        if [[ "${DRY_RUN}" != "true" ]] && [[ -f "${processed_file}" ]]; then
-            if ! upload_file "${processed_file}" "${R2_OUTGOING_PREFIX}"; then
-                log_error "Failed to upload processed file: ${processed_file}"
-                ((files_failed++)) || true
-                continue
-            fi
-        elif [[ "${DRY_RUN}" == "true" ]]; then
-            upload_file "${local_file}" "${R2_OUTGOING_PREFIX}"
-        fi
-        
-        # Move original to processed folder
-        if ! move_remote_file "${remote_file}"; then
-            log_error "Failed to move original file to processed: ${remote_file}"
-            ((files_failed++)) || true
-            continue
-        fi
-        
-        # Clean up local files
-        if [[ "${DRY_RUN}" != "true" ]]; then
-            rm -f "${local_file}" "${processed_file}" 2>/dev/null || true
-        fi
-        
-        ((files_processed++)) || true
-        log_info "Successfully processed: ${remote_file}"
-        
-    done <<< "${incoming_files}"
-    
-    log_info "========================================"
-    log_info "Processing run complete"
-    log_info "  Processed: ${files_processed}"
-    log_info "  Failed:    ${files_failed}"
-    log_info "  Skipped:   ${files_skipped}"
-    log_info "========================================"
+    # Generate and output report
+    generate_summary_report "${files_json}"
     
     return 0
 }
@@ -629,14 +467,18 @@ process_incoming_files() {
 
 show_help() {
     cat << EOF
-${SCRIPT_NAME} v${SCRIPT_VERSION} - Secure R2 file processor
+${SCRIPT_NAME} v${SCRIPT_VERSION} - Read-only R2 bucket scanner
+
+This script scans the incoming/ folder in your R2 bucket and reports what
+files are found. It is completely READ-ONLY and never modifies the bucket.
 
 USAGE:
     ${SCRIPT_NAME} [OPTIONS]
 
 OPTIONS:
     -c, --config FILE    Path to config file (default: ${DEFAULT_CONFIG_FILE})
-    -d, --dry-run        Run without making changes
+    -r, --report-only    Just list files (this is always the default behavior)
+    -j, --json           Output report in JSON format
     -v, --verbose        Enable verbose/debug output
     -h, --help           Show this help message
 
@@ -644,36 +486,38 @@ ENVIRONMENT VARIABLES:
     R2_REMOTE_NAME       rclone remote name (required)
     R2_BUCKET_NAME       R2 bucket name (required)
     R2_INCOMING_PREFIX   Incoming folder prefix (default: ${DEFAULT_INCOMING_PREFIX})
-    R2_OUTGOING_PREFIX   Outgoing folder prefix (default: ${DEFAULT_OUTGOING_PREFIX})
-    R2_PROCESSED_PREFIX  Processed folder prefix (default: ${DEFAULT_PROCESSED_PREFIX})
-    WORKSPACE_DIR        Local workspace directory (default: ${DEFAULT_WORKSPACE_DIR})
-    LOG_FILE             Log file path (default: ${DEFAULT_LOG_FILE})
-    LOCK_FILE            Lock file path (default: ${DEFAULT_LOCK_FILE})
-    MAX_FILE_SIZE_MB     Maximum file size in MB (default: ${DEFAULT_MAX_FILE_SIZE_MB})
+    MAX_FILE_SIZE_MB     Maximum file size for validation (default: ${DEFAULT_MAX_FILE_SIZE_MB})
     ALLOWED_EXTENSIONS   Comma-separated allowed extensions (default: ${DEFAULT_ALLOWED_EXTENSIONS})
 
 EXAMPLES:
-    # Run with default config
+    # Basic scan
     ${SCRIPT_NAME}
 
-    # Run with custom config
+    # Scan with custom config
     ${SCRIPT_NAME} -c /path/to/config
 
-    # Dry run with verbose output
-    ${SCRIPT_NAME} -d -v
+    # JSON output
+    ${SCRIPT_NAME} --json
+
+    # Verbose scan
+    ${SCRIPT_NAME} -v
 
     # Set required vars and run
     R2_REMOTE_NAME=myremote R2_BUCKET_NAME=mybucket ${SCRIPT_NAME}
 
-CONFIG FILE FORMAT:
-    R2_REMOTE_NAME=myremote
-    R2_BUCKET_NAME=mybucket
-    ALLOWED_EXTENSIONS=txt,csv,json,pdf
+OUTPUT:
+    Reports files found in incoming/ with validation status:
+    - ✓ Valid files that pass all checks
+    - ⚠ Invalid type (extension not in whitelist)
+    - ⚠ Oversized (exceeds MAX_FILE_SIZE_MB)
 
-SECURITY NOTES:
-    - Config file should have permissions 600 (owner read/write only)
-    - Never commit credentials to version control
-    - Use rclone's built-in config encryption for sensitive data
+SECURITY:
+    This script is READ-ONLY safe:
+    - Never downloads files
+    - Never uploads files
+    - Never moves or deletes files
+    - Never modifies the bucket in any way
+    - Only uses rclone list operations
 
 EOF
 }
@@ -689,8 +533,12 @@ parse_arguments() {
                 CONFIG_FILE="$2"
                 shift 2
                 ;;
-            -d|--dry-run)
-                DRY_RUN=true
+            -r|--report-only)
+                REPORT_ONLY=true  # Always true anyway
+                shift
+                ;;
+            -j|--json)
+                JSON_OUTPUT=true
                 shift
                 ;;
             -v|--verbose)
@@ -734,7 +582,7 @@ preflight_checks() {
         return 1
     fi
     
-    # Test remote connectivity
+    # Test remote connectivity (read-only operation)
     log_debug "Testing remote connectivity..."
     if ! rclone lsd "${R2_REMOTE_NAME}:${R2_BUCKET_NAME}" --max-depth 1 &>/dev/null; then
         log_error "Cannot access bucket: ${R2_REMOTE_NAME}:${R2_BUCKET_NAME}"
@@ -770,21 +618,9 @@ main() {
         exit 1
     fi
     
-    # Initialize logging
-    init_logging
-    
-    # Setup signal handlers for cleanup
-    setup_signal_handlers
-    
     log_info "========================================"
-    log_info "${SCRIPT_NAME} v${SCRIPT_VERSION} starting"
+    log_info "${SCRIPT_NAME} v${SCRIPT_VERSION} (READ-ONLY SCANNER)"
     log_info "========================================"
-    
-    # Acquire lock
-    if ! acquire_lock; then
-        log_error "Failed to acquire lock, exiting"
-        exit 1
-    fi
     
     # Run preflight checks
     if ! preflight_checks; then
@@ -792,13 +628,13 @@ main() {
         exit 1
     fi
     
-    # Run main processing
-    if ! process_incoming_files; then
-        log_error "Processing failed"
+    # Run scan (always read-only)
+    if ! scan_incoming_files; then
+        log_error "Scan failed"
         exit 1
     fi
     
-    log_info "${SCRIPT_NAME} completed successfully"
+    log_info "Scan completed successfully"
     exit 0
 }
 
